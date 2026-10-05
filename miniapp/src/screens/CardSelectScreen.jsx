@@ -231,7 +231,6 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
           taken={effectiveData.taken_cards}
           mine={effectiveData.my_cards}
           selected={selected}
-          onToggle={toggle}
           onPreview={showPreview}
         />
 
