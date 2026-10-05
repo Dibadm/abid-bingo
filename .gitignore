@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.bak
+.env
+.pytest_cache/
+.env.*
+*.db
+backups/
+bot.pid
+
+# Node
+node_modules/
+dist/
+miniapp/dist/
+package-lock.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Local Python engine/venv
+backend/py_engine/
+backend/Python-3.11.15/
+
+# Local tools
+cloudflared.exe
+cloudflared.err
+cloudflared.log
+config.yml
+patcher.py
+
+# Stray files
+miniapp/api_server.py
+miniapp/requirements.txt
+habesha_bet.db
+bingo.db

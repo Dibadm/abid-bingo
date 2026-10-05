@@ -1,0 +1,60 @@
+/* src/styles/tokens.css
+   Single source of truth for all design tokens.
+   theme.css re-exports everything here and adds component classes.
+*/
+
+:root {
+  /* ── Colors ─────────────────────────────────────────────────── */
+  --color-bg: #0a1410;
+  --color-surface: #142a21;
+  --color-surface-elevated: #102019;
+  --color-surface-taken: #1c1c1c;
+  --color-border: #1f3a2c;
+
+  --color-gold: #e0b03c;
+  --color-gold-bright: #f5c94a;
+
+  --color-green: #0d7a3e;
+  --color-green-bright: #15a854;
+
+  /* Teal — reserved for "live" / in-motion states (countdowns, jackpot
+     ticking, ball calls) so it never competes visually with gold, which
+     stays reserved for money. */
+  --color-live: #2dd4a8;
+  --color-live-bright: #4be8c0;
+
+  --color-text: #f1f5f2;
+  --color-text-dim: #8fa396;
+  --color-text-faint: #5c6e62;
+
+  --color-success: #15a854;
+  --color-danger: #d65a4a;
+
+  /* ── Glass surfaces ────────────────────────────────────────────
+     Semi-transparent panel fills + blur, layered over the radial-
+     gradient body background so depth reads through the UI instead
+     of sitting on flat color. */
+  --glass-fill: rgba(20, 42, 33, 0.55);
+  --glass-fill-elevated: rgba(16, 32, 25, 0.65);
+  --glass-border: rgba(224, 176, 60, 0.14);
+  --glass-blur: 18px;
+
+  /* ── Spacing ─────────────────────────────────────────────────── */
+  --sp-xs: 4px;
+  --sp-sm: 8px;
+  --sp-md: 16px;
+  --sp-lg: 24px;
+  --sp-xl: 32px;
+
+  /* ── Radius ──────────────────────────────────────────────────── */
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 20px;
+
+  /* ── Shadows ─────────────────────────────────────────────────── */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --glow-gold: 0 0 0 1px rgba(224, 176, 60, 0.25), 0 4px 20px rgba(224, 176, 60, 0.18);
+  --glow-live: 0 0 0 1px rgba(45, 212, 168, 0.25), 0 4px 16px rgba(45, 212, 168, 0.16);
+}
