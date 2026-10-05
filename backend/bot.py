@@ -17,6 +17,7 @@ import asyncio
 import html
 import logging
 import os
+import requests
 import sys
 import time as _time
 from datetime import datetime
@@ -217,10 +218,44 @@ async def group_broadcast(bot, game_id, text, reply_markup=None):
             )
 
 
+def _tg_api_call(method, payload):
+    """Blocking Bot API call, run in a worker thread by _tg_direct so the
+    event loop is never blocked. Used as the fallback path when this
+    process has no Application instance."""
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{config.BOT_TOKEN}/{method}",
+            json=payload, timeout=15,
+        )
+        data = resp.json()
+    except Exception as e:
+        return False, str(e)
+    if not data.get("ok"):
+        return False, str(data.get("description", "telegram_error"))
+    return True, ""
+
+
+async def _tg_direct(method, payload):
+    """Send via the Bot API over HTTP. Necessary because api_handlers.py
+    calls these helpers from the API process, which never runs
+    bot.main() and so has no _bot_app to send through."""
+    loop = asyncio.get_running_loop()
+    ok, err = await loop.run_in_executor(None, _tg_api_call, method, payload)
+    if not ok:
+        logger.warning(f"[tg_direct] {method} failed: {err}")
+    return ok
+
+
+def _tg_text_payload(chat_id, text, parse_mode=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    return payload
+
+
 async def send_message_to_chat(chat_id, text):
     if _bot_app is None:
-        logger.warning("[broadcast] bot not initialized")
-        return False
+        return await _tg_direct("sendMessage", _tg_text_payload(chat_id, text))
     try:
         await _bot_app.bot.send_message(chat_id=chat_id, text=text)
         return True
@@ -231,8 +266,7 @@ async def send_message_to_chat(chat_id, text):
 
 async def send_photo_to_chat(chat_id, photo, caption=None):
     if _bot_app is None:
-        logger.warning("[broadcast] bot not initialized")
-        return False
+        return await _tg_direct("sendPhoto", {"chat_id": chat_id, "photo": photo, "caption": caption})
     try:
         await _bot_app.bot.send_photo(chat_id=chat_id, photo=photo, caption=caption)
         return True
@@ -250,11 +284,13 @@ def get_bot():
 
 async def send_admin_alert(text: str, parse_mode=None):
     try:
-        bot_instance = get_bot()
-        if bot_instance is None:
-            return
         chat_ids = [x.strip() for x in config.ADMIN_NOTIFICATION_CHAT_IDS.split(",") if x.strip()] if config.ADMIN_NOTIFICATION_CHAT_IDS else [str(x) for x in config.ADMIN_IDS]
+        bot_instance = _bot_app.bot if _bot_app is not None else None
         for chat_id in chat_ids:
+            if bot_instance is None:
+                if not await _tg_direct("sendMessage", _tg_text_payload(chat_id, text, parse_mode)):
+                    logger.error(f"[admin_alert] failed for {chat_id}")
+                continue
             try:
                 await bot_instance.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
             except Exception as e:
