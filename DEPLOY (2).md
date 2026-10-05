@@ -37,16 +37,53 @@ service does not depend on the bot having started first.
 
 ## Build command
 
-Identical for both services, with Root Directory set to `backend`:
+Identical for both services. **Leave Root Directory empty** — the build
+command below is written relative to the repo root:
 
 ```
-pip install -r requirements.txt && cd ../miniapp && npm install && npm run build
+cd backend && python3 -m pip install -r requirements.txt && cd .. && bash -lc "cd miniapp && npm install --include=dev && npm run build"
 ```
 
 `npm run build` writes `miniapp/dist/`. `api_server.py` mounts it at `/`
 via `pathlib.Path(__file__).parent.parent / "miniapp" / "dist"`, so the
 build must run inside the repo, not inside `backend/`. `dist/` is
 gitignored and rebuilt on every deploy.
+
+Every one of those four details is load-bearing. Each was a separate
+`build_failed`:
+
+- **`python3 -m pip`, not bare `pip`.** The bare `pip` on Render's Python
+  image is bound to a different interpreter and dies on
+  `pip install -r requirements.txt`.
+- **`bash -lc` around the npm part.** `node` is not on `PATH` in
+  Render's non-login build shell (`node -v` fails, `npm -v` works). A
+  login shell sources the profile that puts Node on `PATH`.
+- **`cd miniapp` from the repo root, not `cd ../miniapp` from `backend/`.**
+  The login shell does not reliably inherit the `cd backend` working
+  directory, so the relative path resolves to a directory that does not
+  exist.
+- **`npm install --include=dev`.** `vite` and `@vitejs/plugin-react` are
+  devDependencies and are skipped otherwise, so `npm run build` fails with
+  `vite: not found`.
+
+## Pin the Python version
+
+Set **`PYTHON_VERSION=3.13.4`** as an environment variable on both
+services.
+
+This is the single most important setting. Without it Render picks a
+default Python that has no prebuilt wheel for `pydantic-core` 2.23.4
+(pinned transitively by `pydantic==2.9.2`), so pip falls back to
+compiling it from source with Rust and the whole build fails with:
+
+```
+error: metadata-generation-failed
+× Encountered error while generating package metadata.
+╰─> pydantic-core
+```
+
+The same `requirements.txt` installs fine on a machine with Python 3.13,
+which is what makes this confusing to debug locally.
 
 ## Environment variables
 
@@ -56,11 +93,12 @@ services. Do not commit them, and do not paste them into `config.py` —
 
 | Variable          | Web | Bot | Value |
 | ----------------- | :-: | :-: | ----- |
+| `PYTHON_VERSION`  | yes | yes | `3.13.4` — required, see above |
 | `DATABASE_URL`    | yes | yes | Neon/Postgres connection string (see below) |
 | `MINI_APP_URL`    | no  | yes | `https://habesha-bet-web.onrender.com` |
-| `BOT_TOKEN`       | no  | yes | From @BotFather |
-| `BOT_USERNAME`    | no  | yes | e.g. `Vscoodebot` |
-| `ADMIN_IDS`       | no  | yes | Comma-separated numeric Telegram IDs |
+| `BOT_TOKEN`       | yes | yes | From @BotFather — the **web service needs it too**, it signs `initData` |
+| `BOT_USERNAME`    | no  | yes | e.g. `abid1wbot` |
+| `ADMIN_IDS`       | yes | yes | Comma-separated numeric Telegram IDs |
 | `DB_PATH`         | no  | no  | Leave unset — `DATABASE_URL` takes precedence |
 | `PRODUCTION`      | no  | no  | `true` to enable scheduled DB backups |
 
@@ -101,16 +139,32 @@ it warm.
 
 ## Troubleshooting
 
+Render's API does not expose build logs, so a `build_failed` gives you no
+error text. Bisect by replacing the build command with progressively
+larger pieces and watching whether it reaches `update_in_progress`.
+
+- **`metadata-generation-failed` / `pydantic-core`** — `PYTHON_VERSION` is
+  not set. See above.
+- **`vite: not found`** — `npm install` skipped devDependencies. Use
+  `--include=dev`.
+- **`node: command not found`** — the npm commands are not wrapped in
+  `bash -lc`.
+- **`pip: command not found`, or pip dies mid-install** — use
+  `python3 -m pip`, not `pip`.
+- **Build is fine, service has no live ports** — the start command is
+  `python bot.py` on a *Web Service*. The bot never binds `$PORT`; it
+  belongs on a Background Worker.
 - **Blank Mini App / `{"detail":"Mini App not built"}`** — `dist/` is
   missing, so the build command didn't run. Check the build log.
-- **Service reports no live ports** — the start command is `python bot.py`
-  on a *Web Service*. The bot never binds `$PORT`; it belongs on a
-  Background Worker.
 - **401 on every API call** — `BOT_TOKEN` doesn't match the bot the Mini
-  App was opened from. `initData` is signed per-bot.
+  App was opened from. `initData` is signed per-bot. The web service needs
+  `BOT_TOKEN` too, not just the bot.
 - **Menu button missing** — `MINI_APP_URL` wasn't set before `bot.py`
-  started. Set it, then restart the bot service.
+  started. Set it, then restart the bot service. Confirm with
+  `getChatMenuButton`; it should report `type: web_app`, not `commands`.
 - **`relation does not exist`** — the web service creates its schema on
   startup; check its logs. If the bot service errors first, restart it.
 - **Bot and API disagree on state** — both must point at the same
   `DATABASE_URL`.
+- **Free web service sleeps mid-game** — expected; ping `/health` on a
+  cron or upgrade.
