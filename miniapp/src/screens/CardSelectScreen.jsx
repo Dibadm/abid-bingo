@@ -31,7 +31,7 @@ export default function CardSelectScreen({ roomFee, onBack, onGameStart }) {
   }, [roomFee, onGameStart]);
 
   const { data: pollData, error: pollError, loading } = usePolling(load, {
-    interval: 2000,
+    interval: 1000,
     backoffMax: 30000,
   });
 

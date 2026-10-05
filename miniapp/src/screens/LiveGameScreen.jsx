@@ -97,7 +97,7 @@ export default function LiveGameScreen({ gameId, onFinished }) {
     return res;
   }, [gameId, refreshUser, playAnnouncement, playGameStart]);
 
-  const baseInterval = state === 'running' ? 3000 : 5000;
+  const baseInterval = state === 'running' ? 1500 : 2500;
   const { data, error, loading, resetBackoff } = usePolling(fetchGameState, {
     interval: baseInterval,
     backoffMax: 30000,

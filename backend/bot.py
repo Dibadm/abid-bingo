@@ -14,6 +14,7 @@
 # ============================================
 
 import asyncio
+import functools
 import html
 import logging
 import os
@@ -73,6 +74,20 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+
+async def _dbcall(fn, *args, **kwargs):
+    """Run a blocking database call in a worker thread.
+
+    Every database.py function is synchronous psycopg2 I/O costing at
+    least one network round trip. Calling one directly from this module's
+    async game loop blocks the event loop for that whole round trip, so
+    the asyncio.sleep() calls around it all overshoot and the countdown,
+    the call cadence and the payout path each run slow. Offloading keeps
+    the loop free to keep time.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
 # Conversation states
 (
@@ -332,7 +347,7 @@ async def ensure_game_lifecycle_started(context, room_fee, game_id):
 async def _scan_and_start_games(application):
     active_triggers = set()
     for fee in config.ROOM_FEES:
-        game = db.get_or_create_active_game(fee)
+        game = await _dbcall(db.get_or_create_active_game, fee)
         task_done = ACTIVE_GAME_TASKS[fee].done() if fee in ACTIVE_GAME_TASKS else "not_running"
         logger.debug("[scanner] room=%s game_id=%s state=%s task_status=%s", fee, game["id"], game["state"], task_done)
 
@@ -340,7 +355,7 @@ async def _scan_and_start_games(application):
             active_triggers.remove(game["id"])
 
         if game and game["state"] == "waiting" and game["id"] not in active_triggers:
-            cards_sold = db.count_cards_sold(game["id"])
+            cards_sold = await _dbcall(db.count_cards_sold, game["id"])
             if cards_sold >= config.MIN_CARDS_TO_START:
                 logger.info(f"Scanner: {cards_sold} cards in Room {fee}, starting countdown...")
                 active_triggers.add(game["id"])
@@ -389,14 +404,14 @@ async def resolve_round_winners(bot, game_id, room_fee, winners_found):
     database.resolve_game_winners), so if an instant API claim resolved
     this exact game in the same instant, only one of them actually pays
     out — this function just backs off quietly if it loses that race."""
-    if not db.try_claim_game_resolution(game_id):
+    if not await _dbcall(db.try_claim_game_resolution, game_id):
         logger.info(f"[lifecycle] game {game_id} already resolved elsewhere (likely an instant API claim) — not paying out again")
-        pending = db.drain_broadcasts(game_id)
+        pending = await _dbcall(db.drain_broadcasts, game_id)
         for text in pending:
             await group_broadcast(bot, game_id, text)
         return
 
-    result = db.resolve_game_winners(game_id, winners_found)
+    result = await _dbcall(db.resolve_game_winners, game_id, winners_found)
 
     winner_lines = []
     for w in result["winner_lines"]:
@@ -413,7 +428,7 @@ async def resolve_round_winners(bot, game_id, room_fee, winners_found):
     # for... actually if we won the claim, nothing else could have
     # queued a resolution broadcast for this same game — this just
     # covers any other queued message, defensively, so nothing is lost).
-    pending = db.drain_broadcasts(game_id)
+    pending = await _dbcall(db.drain_broadcasts, game_id)
     for extra_text in pending:
         await group_broadcast(bot, game_id, extra_text)
 
@@ -423,15 +438,15 @@ async def resolve_round_no_winner(bot, game_id, room_fee, called_numbers):
     through the atomic guard — an instant manual claim via the API could
     have resolved this game in the same moment the bot's loop was about
     to give up and refund everyone."""
-    if not db.try_claim_game_resolution(game_id):
+    if not await _dbcall(db.try_claim_game_resolution, game_id):
         logger.info(f"[lifecycle] game {game_id} resolved elsewhere right as it was about to be refunded — not refunding")
-        pending = db.drain_broadcasts(game_id)
+        pending = await _dbcall(db.drain_broadcasts, game_id)
         for text in pending:
             await group_broadcast(bot, game_id, text)
         return
 
-    refunded = db.refund_game(game_id)
-    db.set_game_state(game_id, "finished")
+    refunded = await _dbcall(db.refund_game, game_id)
+    await _dbcall(db.set_game_state, game_id, "finished")
     text = f"😔 No winner after {len(called_numbers)} calls. All {len(refunded)} players refunded."
     await group_broadcast(bot, game_id, text)
 
@@ -465,9 +480,9 @@ async def _check_externally_resolved(bot, game_id) -> bool:
     so, send whatever announcement it queued and report True so the
     calling loop stops immediately instead of continuing to call more
     numbers for a game that's already over."""
-    game = db.get_game(game_id)
+    game = await _dbcall(db.get_game, game_id)
     if game is None or game["state"] in ("resolving", "finished"):
-        pending = db.drain_broadcasts(game_id)
+        pending = await _dbcall(db.drain_broadcasts, game_id)
         for text in pending:
             await group_broadcast(bot, game_id, text)
         return True
@@ -477,49 +492,67 @@ async def _check_externally_resolved(bot, game_id) -> bool:
 async def run_game_lifecycle(bot, room_fee, game_id):
     from game_state import GAME_COUNTDOWN_START, ACTIVE_GAME_TASKS, GROUP_BROADCAST_MSG
 
-    stuck, reason = db.is_game_stuck(game_id)
+    stuck, reason = await _dbcall(db.is_game_stuck, game_id)
     if stuck:
         logger.warning("[lifecycle] game %s stuck (%s) — finishing and refunding", game_id, reason)
         try:
-            db.refund_game(game_id)
-            db.clear_manual_bingo_claims(game_id)
-            db.set_game_state(game_id, "finished")
+            await _dbcall(db.refund_game, game_id)
+            await _dbcall(db.clear_manual_bingo_claims, game_id)
+            await _dbcall(db.set_game_state, game_id, "finished")
         except Exception:
             logger.exception("[lifecycle] failed to recover stuck game %s", game_id)
         return
 
     try:
         GAME_COUNTDOWN_START[game_id] = _time.monotonic()
-        db.set_game_countdown_start(game_id)
+        await _dbcall(db.set_game_countdown_start, game_id)
 
+        poll_overhead = 0.0
         for remaining in range(config.COUNTDOWN_SECONDS, 0, -1):
-            await asyncio.sleep(1)
+            # Give back exactly the one tick the previous poll overran,
+            # not every tick after it (which would run the countdown short).
+            await asyncio.sleep(max(0.05, 1.0 - poll_overhead))
+            poll_overhead = 0.0
 
-            current_state = db.get_game(game_id)
+            # A countdown is a timer, not a polling loop. Hitting the DB
+            # every second made each tick cost 1s + a full round trip, so
+            # the "30 second" countdown actually took ~45s and the Mini
+            # App sat on "Starting..." for the difference. Poll only every
+            # few seconds, ask both questions in one round trip, and give
+            # back whatever the query cost so the full COUNTDOWN_SECONDS
+            # still elapses in COUNTDOWN_SECONDS.
+            if remaining % 5 and remaining > 3:
+                continue
+
+            poll_started = _time.monotonic()
+            current_state, sold = await asyncio.gather(
+                _dbcall(db.get_game, game_id),
+                _dbcall(db.count_cards_sold, game_id),
+            )
+            poll_overhead = _time.monotonic() - poll_started
+
             if current_state is None or current_state["state"] == "finished":
                 logger.info(f"[lifecycle] game {game_id} already finished during countdown — exiting")
                 return
 
-            sold = db.count_cards_sold(game_id)
             logger.info(f"[lifecycle] game {game_id} countdown t={remaining} sold={sold}")
             if sold > 0 and remaining % 5 == 0:
-                game = db.get_game(game_id)
-                text = f"🎟 Room {room_fee} ETB\nPool: {fmt(game['pool'])} ETB\nCards sold: {sold}\nCountdown: {remaining}s"
+                text = f"🎟 Room {room_fee} ETB\nPool: {fmt(current_state['pool'])} ETB\nCards sold: {sold}\nCountdown: {remaining}s"
                 await group_broadcast(bot, game_id, text)
 
         GAME_COUNTDOWN_START.pop(game_id, None)
-        db.clear_game_countdown_start(game_id)
+        await _dbcall(db.clear_game_countdown_start, game_id)
 
-        sold = db.count_cards_sold(game_id)
+        sold = await _dbcall(db.count_cards_sold, game_id)
         if sold < config.MIN_CARDS_TO_START:
             logger.info(f"[lifecycle] game {game_id} refunding: only {sold} cards sold, need {config.MIN_CARDS_TO_START}")
             await handle_insufficient_players_refund(bot, game_id)
             return
 
         logger.info(f"[lifecycle] game {game_id} starting: {sold} cards sold")
-        db.set_game_state(game_id, "running")
+        await _dbcall(db.set_game_state, game_id, "running")
 
-        bonus = db.try_trigger_jackpot(game_id)
+        bonus = await _dbcall(db.try_trigger_jackpot, game_id)
         if bonus:
             await group_broadcast(
                 bot, game_id,
@@ -539,12 +572,12 @@ async def run_game_lifecycle(bot, room_fee, game_id):
                 return
 
             called_numbers.append(number)
-            db.add_called_number(game_id, call_index, number)
+            await _dbcall(db.add_called_number, game_id, call_index, number)
 
-            auto_winners = push_call_and_check_wins(game_id, called_numbers)
+            auto_winners = await _dbcall(push_call_and_check_wins, game_id, called_numbers)
 
             winners_found.update(auto_winners)
-            winners_found.update(_check_manual_claims(game_id, called_numbers))
+            winners_found.update(await _dbcall(_check_manual_claims, game_id, called_numbers))
 
             if winners_found:
                 logger.info(f"[lifecycle] WIN DETECTED game {game_id} winners={list(winners_found.keys())} types={list(winners_found.values())}")
@@ -554,8 +587,11 @@ async def run_game_lifecycle(bot, room_fee, game_id):
             amharic = bingo.number_to_amharic(number)
             last_6 = called_numbers[-6:]
             history_str = ", ".join(map(str, last_6))
-            player_count = len(db.get_game_players(game_id))
-            pool = db.get_pool(game_id)
+            players, pool = await asyncio.gather(
+                _dbcall(db.get_game_players, game_id),
+                _dbcall(db.get_pool, game_id),
+            )
+            player_count = len(players)
             text = f"🎱 {letter}-{number} / {amharic}\nCalls: {call_index}/{config.MAX_NUMBERS_CALLED}\nPool: {fmt(pool)} ETB\nPlayers: {player_count}\nLast 6: {history_str}"
             await group_broadcast(bot, game_id, text)
 
@@ -564,14 +600,24 @@ async def run_game_lifecycle(bot, room_fee, game_id):
             # otherwise a claim made mid-gap could sit unresolved for up
             # to the full delay before the bot notices it.
             claim_poll_step = 0.5
-            elapsed = 0.0
+            gap_deadline = _time.monotonic() + config.CALL_DELAY_SECONDS
             resolved_externally = False
-            while elapsed < config.CALL_DELAY_SECONDS:
-                step = min(claim_poll_step, config.CALL_DELAY_SECONDS - elapsed)
-                await asyncio.sleep(step)
-                elapsed += step
-                if await _check_externally_resolved(bot, game_id):
-                    resolved_externally = True
+            while True:
+                now = _time.monotonic()
+                if now >= gap_deadline:
+                    break
+                # Anchor the gap to a wall-clock deadline rather than
+                # counting sleep() steps. Stepping by a fixed 0.5s while
+                # each step also paid for two sequential DB round trips
+                # made CALL_DELAY_SECONDS=4 actually last ~8s, so numbers
+                # were called at half the intended pace. The two checks
+                # are independent reads, so run them concurrently.
+                await asyncio.sleep(min(claim_poll_step, gap_deadline - now))
+                resolved_externally, claim_winners = await asyncio.gather(
+                    _check_externally_resolved(bot, game_id),
+                    _dbcall(_check_manual_claims, game_id, called_numbers),
+                )
+                if resolved_externally:
                     break
                 # This is a defensive fallback now — the normal path for a
                 # manual claim is handle_claim_bingo resolving it
@@ -579,7 +625,7 @@ async def run_game_lifecycle(bot, room_fee, game_id):
                 # up as soon as it happens. This only matters if that
                 # somehow didn't complete (e.g. the API process died
                 # mid-request after recording the claim).
-                winners_found.update(_check_manual_claims(game_id, called_numbers))
+                winners_found.update(claim_winners)
                 if winners_found:
                     break
             if resolved_externally:
@@ -590,7 +636,7 @@ async def run_game_lifecycle(bot, room_fee, game_id):
                 break
 
         if not winners_found:
-            post_loop_result = _check_manual_claims(game_id, called_numbers)
+            post_loop_result = await _dbcall(_check_manual_claims, game_id, called_numbers)
             logger.info(f"[lifecycle] post-loop manual claim check for game {game_id}: {post_loop_result}")
             winners_found.update(post_loop_result)
 
@@ -608,10 +654,10 @@ async def run_game_lifecycle(bot, room_fee, game_id):
         capture_error(f"game lifecycle crashed for room {room_fee}, game {game_id}")
         refund_ok = True
         try:
-            game_check = db.get_game(game_id)
+            game_check = await _dbcall(db.get_game, game_id)
             if game_check and game_check["state"] != "finished":
-                db.refund_game(game_id)
-                db.set_game_state(game_id, "finished")
+                await _dbcall(db.refund_game, game_id)
+                await _dbcall(db.set_game_state, game_id, "finished")
         except Exception:
             refund_ok = False
             logger.exception("[lifecycle] refund-on-crash ALSO failed")

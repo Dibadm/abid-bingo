@@ -25,6 +25,7 @@
 
 import psycopg2
 from psycopg2 import pool, extras, errors
+from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 import json
 import logging
 import os
@@ -59,7 +60,8 @@ def get_connection():
                 )
     conn = _db_pool.getconn()
     try:
-        conn.rollback()
+        if conn.get_transaction_status() != TRANSACTION_STATUS_IDLE:
+            conn.rollback()
     except Exception:
         pass
     conn.autocommit = False
@@ -70,7 +72,8 @@ def release_connection(conn):
     global _db_pool
     if _db_pool is not None and conn is not None:
         try:
-            conn.rollback()
+            if conn.get_transaction_status() != TRANSACTION_STATUS_IDLE:
+                conn.rollback()
         except Exception:
             pass
         try:
@@ -80,6 +83,37 @@ def release_connection(conn):
                 conn.close()
             except Exception:
                 pass
+
+
+# =====================================================================
+# AUTOCOMMIT READS
+# =====================================================================
+# Every read above costs three round trips to Neon (rollback on acquire,
+# the query, rollback on release) for a query that never needed a
+# transaction. At ~200-250ms per round trip that is ~3x the cost of the
+# query itself, and the game loop runs these several times per second.
+# These helpers run in autocommit so a read is a single round trip.
+
+def _fetch_one(sql, params=()):
+    conn = get_connection()
+    try:
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur.fetchone()
+    finally:
+        release_connection(conn)
+
+
+def _fetch_all(sql, params=()):
+    conn = get_connection()
+    try:
+        conn.autocommit = True
+        cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+        cur.execute(sql, params)
+        return cur.fetchall()
+    finally:
+        release_connection(conn)
 
 
 def init_db():
@@ -1106,12 +1140,7 @@ def get_or_create_active_game(room_fee: float):
 
 
 def get_game(game_id: int):
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-    cur.execute("SELECT * FROM games WHERE id = %s", (game_id,))
-    row = cur.fetchone()
-    release_connection(conn)
-    return row
+    return _fetch_one("SELECT * FROM games WHERE id = %s", (game_id,))
 
 
 def set_game_state(game_id: int, state: str):
@@ -1180,14 +1209,10 @@ def get_cards_for_players(game_id: int, user_ids: list) -> dict:
     grow."""
     if not user_ids:
         return {}
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-    cur.execute(
+    rows = _fetch_all(
         "SELECT owner_id, card_index FROM game_cards WHERE game_id = %s AND owner_id = ANY(%s)",
         (game_id, list(user_ids)),
     )
-    rows = cur.fetchall()
-    release_connection(conn)
     out = {uid: [] for uid in user_ids}
     for r in rows:
         out.setdefault(r["owner_id"], []).append(r["card_index"])
@@ -1346,12 +1371,7 @@ def get_game_player(game_id: int, user_id: int):
 
 
 def get_game_players(game_id: int) -> list:
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-    cur.execute("SELECT * FROM game_players WHERE game_id = %s ORDER BY id ASC", (game_id,))
-    rows = cur.fetchall()
-    release_connection(conn)
-    return rows
+    return _fetch_all("SELECT * FROM game_players WHERE game_id = %s ORDER BY id ASC", (game_id,))
 
 
 def get_user_chat_id(user_id: int):
@@ -1428,12 +1448,8 @@ def get_user_active_game(user_id: int):
 
 
 def count_cards_sold(game_id: int) -> int:
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-    cur.execute("SELECT COUNT(*) as c FROM game_cards WHERE game_id = %s", (game_id,))
-    row = cur.fetchone()
-    release_connection(conn)
-    return row["c"]
+    row = _fetch_one("SELECT COUNT(*) as c FROM game_cards WHERE game_id = %s", (game_id,))
+    return row["c"] if row else 0
 
 
 def get_all_game_cards(game_id: int) -> list:
@@ -1899,14 +1915,10 @@ def record_manual_bingo_claim(game_id: int, user_id: int, card_indices: list):
 
 
 def get_manual_bingo_claims(game_id: int) -> dict:
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-    cur.execute(
+    rows = _fetch_all(
         "SELECT user_id, card_indices FROM manual_bingo_claims WHERE game_id = %s AND resolved = 0",
         (game_id,)
     )
-    rows = cur.fetchall()
-    release_connection(conn)
     return {row["user_id"]: json.loads(row["card_indices"]) for row in rows}
 
 
