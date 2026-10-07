@@ -39,6 +39,9 @@ import threading
 import logging
 import base64
 import json
+import asyncio
+import functools
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, unquote
 
 import config
@@ -48,6 +51,25 @@ from database import backup_database
 from monitoring import init_monitoring, capture_error
 
 logger = logging.getLogger("habesha_bet")
+
+# Dedicated thread pool for synchronous handler bodies. FastAPI runs
+# sync route functions on its own 40-thread default pool, so at 200
+# concurrent players polling every 1-1.5s every thread is occupied by
+# psycopg2 I/O and new requests queue behind it. Running the handler
+# bodies here instead keeps the event loop free to accept and dispatch.
+_db_executor = ThreadPoolExecutor(max_workers=50, thread_name_prefix="habesha-db")
+
+
+async def _run_db(fn, *args, **kwargs):
+    """Run a synchronous handler in the DB thread pool.
+
+    The handler keeps its internal call order, but the event loop is
+    free to accept the next request the moment this one is dispatched,
+    instead of waiting for the full handler (and every DB round trip
+    inside it) to complete.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_db_executor, functools.partial(fn, *args, **kwargs))
 
 
 def _user_id_from_init_data(init_data: str) -> str | None:
@@ -308,82 +330,82 @@ class DepositAccountCreateBody(BaseModel):
 # =====================================================================
 
 @app.get("/api/bootstrap")
-def bootstrap(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None), x_username: Optional[str] = Header(None)):
+async def bootstrap(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None), x_username: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
     username = x_username or str(user_id)
-    return _respond(handlers.handle_bootstrap(user_id, username))
+    return _respond(await _run_db(handlers.handle_bootstrap, user_id, username))
 
 
 @app.post("/api/set-phone")
-def set_phone(body: SetPhoneBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def set_phone(body: SetPhoneBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_set_phone(user_id, body.phone))
+    return _respond(await _run_db(handlers.handle_set_phone, user_id, body.phone))
 
 
 @app.post("/api/set-language")
-def set_language(body: SetLanguageBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def set_language(body: SetLanguageBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_set_language(user_id, body.language))
+    return _respond(await _run_db(handlers.handle_set_language, user_id, body.language))
 
 
 @app.post("/api/onboarding-seen")
-def onboarding_seen(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def onboarding_seen(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_mark_onboarding_seen(user_id))
+    return _respond(await _run_db(handlers.handle_mark_onboarding_seen, user_id))
 
 
 @app.get("/api/rooms")
-def get_rooms(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_rooms(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_rooms())
+    return _respond(await _run_db(handlers.handle_get_rooms))
 
 
 @app.get("/api/my-active-game")
-def my_active_game(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def my_active_game(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_my_active_game(user_id))
+    return _respond(await _run_db(handlers.handle_get_my_active_game, user_id))
 
 
 @app.get("/api/rooms/{room_fee}/cards")
-def get_room_cards(room_fee: float, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_room_cards(room_fee: float, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_room_cards(user_id, room_fee))
+    return _respond(await _run_db(handlers.handle_get_room_cards, user_id, room_fee))
 
 
 @app.get("/api/cards/{card_index}/preview")
-def get_card_preview(card_index: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_card_preview(card_index: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_card_preview(card_index))
+    return _respond(await _run_db(handlers.handle_get_card_preview, card_index))
 
 
 @app.post("/api/buy-cards")
-def buy_cards(body: BuyCardsBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def buy_cards(body: BuyCardsBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_buy_cards(user_id, body.room_fee, body.card_indices))
+    return _respond(await _run_db(handlers.handle_buy_cards, user_id, body.room_fee, body.card_indices))
 
 
 @app.get("/api/games/{game_id}/state")
-def get_game_state(game_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_game_state(game_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_game_state(user_id, game_id))
+    return _respond(await _run_db(handlers.handle_get_game_state, user_id, game_id))
 
 
 @app.post("/api/toggle-auto-win")
-def toggle_auto_win(body: ToggleAutoBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def toggle_auto_win(body: ToggleAutoBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_toggle_auto_win(user_id, body.game_id, body.enabled))
+    return _respond(await _run_db(handlers.handle_toggle_auto_win, user_id, body.game_id, body.enabled))
 
 
 @app.post("/api/mark-number")
-def mark_number(body: MarkNumberBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def mark_number(body: MarkNumberBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_mark_number(user_id, body.game_id, body.card_index, body.number))
+    return _respond(await _run_db(handlers.handle_mark_number, user_id, body.game_id, body.card_index, body.number))
 
 
 @app.post("/api/claim-bingo")
-def claim_bingo(body: ClaimBingoBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def claim_bingo(body: ClaimBingoBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_claim_bingo(user_id, body.game_id))
+    return _respond(await _run_db(handlers.handle_claim_bingo, user_id, body.game_id))
 
 
 
@@ -392,27 +414,27 @@ def claim_bingo(body: ClaimBingoBody, x_init_data: Optional[str] = Header(None),
 # =====================================================================
 
 @app.get("/api/deposit-account")
-def get_deposit_account(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_deposit_account(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_deposit_account())
+    return _respond(await _run_db(handlers.handle_get_deposit_account))
 
 
 @app.post("/api/submit-deposit-sms")
-def submit_deposit_sms(body: SubmitSmsBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def submit_deposit_sms(body: SubmitSmsBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_submit_deposit_sms(user_id, body.sms_text, body.expected_amount))
+    return _respond(await _run_db(handlers.handle_submit_deposit_sms, user_id, body.sms_text, body.expected_amount))
 
 
 @app.post("/api/withdraw")
-def withdraw(body: WithdrawBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def withdraw(body: WithdrawBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_withdraw(user_id, body.amount))
+    return _respond(await _run_db(handlers.handle_withdraw, user_id, body.amount))
 
 
 @app.post("/api/transfer")
-def transfer(body: TransferBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def transfer(body: TransferBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_transfer(user_id, body.to_username, body.amount))
+    return _respond(await _run_db(handlers.handle_transfer, user_id, body.to_username, body.amount))
 
 
 # =====================================================================
@@ -420,39 +442,39 @@ def transfer(body: TransferBody, x_init_data: Optional[str] = Header(None), x_de
 # =====================================================================
 
 @app.get("/api/profile")
-def get_profile(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_profile(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_profile(user_id))
+    return _respond(await _run_db(handlers.handle_get_profile, user_id))
 
 
 @app.get("/api/transactions")
-def get_transactions(limit: int = 20, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_transactions(limit: int = 20, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_transactions(user_id, limit))
+    return _respond(await _run_db(handlers.handle_get_transactions, user_id, limit))
 
 
 @app.get("/api/referral")
-def get_referral(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_referral(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_referral_info(user_id))
+    return _respond(await _run_db(handlers.handle_get_referral_info, user_id))
 
 
 @app.post("/api/daily-bonus")
-def claim_daily_bonus(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def claim_daily_bonus(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     user_id = _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_claim_daily_bonus(user_id))
+    return _respond(await _run_db(handlers.handle_claim_daily_bonus, user_id))
 
 
 @app.get("/api/jackpot")
-def get_jackpot(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_jackpot(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_jackpot())
+    return _respond(await _run_db(handlers.handle_get_jackpot))
 
 
 @app.get("/api/recent-winners")
-def get_recent_winners(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def get_recent_winners(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_get_recent_winners())
+    return _respond(await _run_db(handlers.handle_get_recent_winners))
 
 
 # =====================================================================
@@ -461,45 +483,45 @@ def get_recent_winners(x_init_data: Optional[str] = Header(None), x_dev_user_id:
 # =====================================================================
 
 @app.get("/api/admin/dashboard")
-def admin_dashboard(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_dashboard(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_dashboard())
+    return _respond(await _run_db(handlers.handle_admin_dashboard))
 
 
 @app.get("/api/admin/withdrawals")
-def admin_withdrawals(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_withdrawals(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_withdrawals())
+    return _respond(await _run_db(handlers.handle_admin_withdrawals))
 
 
 @app.post("/api/admin/withdrawals/{withdrawal_id}/approve")
-def admin_approve_withdrawal_route(withdrawal_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_approve_withdrawal_route(withdrawal_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     admin_id = _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_approve_withdrawal(admin_id, withdrawal_id))
+    return _respond(await _run_db(handlers.handle_admin_approve_withdrawal, admin_id, withdrawal_id))
 
 
 @app.post("/api/admin/withdrawals/{withdrawal_id}/reject")
-def admin_reject_withdrawal_route(withdrawal_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_reject_withdrawal_route(withdrawal_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     admin_id = _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_reject_withdrawal(admin_id, withdrawal_id))
+    return _respond(await _run_db(handlers.handle_admin_reject_withdrawal, admin_id, withdrawal_id))
 
 
 @app.get("/api/admin/deposit-accounts")
-def admin_get_deposit_accounts(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_get_deposit_accounts(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_get_deposit_accounts())
+    return _respond(await _run_db(handlers.handle_admin_get_deposit_accounts))
 
 
 @app.post("/api/admin/deposit-accounts")
-def admin_add_deposit_account(body: DepositAccountCreateBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_add_deposit_account(body: DepositAccountCreateBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     admin_id = _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_add_deposit_account(admin_id, body.phone, body.recipient_name))
+    return _respond(await _run_db(handlers.handle_admin_add_deposit_account, admin_id, body.phone, body.recipient_name))
 
 
 @app.delete("/api/admin/deposit-accounts/{account_id}")
-def admin_remove_deposit_account(account_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_remove_deposit_account(account_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     admin_id = _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_remove_deposit_account(admin_id, account_id))
+    return _respond(await _run_db(handlers.handle_admin_remove_deposit_account, admin_id, account_id))
 
 
 @app.post("/api/admin/broadcast")
@@ -517,29 +539,29 @@ async def admin_broadcast_image(body: BroadcastImageBody, x_init_data: Optional[
 @app.post("/api/admin/deposit-accounts/{account_id}/toggle")
 async def admin_toggle_deposit_account(account_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     admin_id = _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_toggle_deposit_account(admin_id, account_id))
+    return _respond(await _run_db(handlers.handle_admin_toggle_deposit_account, admin_id, account_id))
 
 
 @app.get("/api/admin/house-wallet")
-def admin_get_house_wallet(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
+async def admin_get_house_wallet(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[str] = Header(None)):
     _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_get_house_wallet())
+    return _respond(await _run_db(handlers.handle_admin_get_house_wallet))
 
 
 @app.post("/api/admin/house-wallet/withdraw")
-def admin_withdraw_house(body: HouseWithdrawBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[int] = Header(None)):
+async def admin_withdraw_house(body: HouseWithdrawBody, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[int] = Header(None)):
     admin_id = _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_withdraw_house(admin_id, body.amount))
+    return _respond(await _run_db(handlers.handle_admin_withdraw_house, admin_id, body.amount))
 
 
 @app.post("/api/admin/games/{game_id}/force-finish")
-def admin_force_finish_game(game_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[int] = Header(None)):
+async def admin_force_finish_game(game_id: int, x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[int] = Header(None)):
     admin_id = _admin_auth(x_init_data, x_dev_user_id)
-    return _respond(handlers.handle_admin_force_finish_stuck_game(admin_id, game_id))
+    return _respond(await _run_db(handlers.handle_admin_force_finish_stuck_game, admin_id, game_id))
 
 
 @app.get("/api/debug/config")
-def debug_config(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[int] = Header(None)):
+async def debug_config(x_init_data: Optional[str] = Header(None), x_dev_user_id: Optional[int] = Header(None)):
     _admin_auth(x_init_data, x_dev_user_id)
     safe = {
         "PRODUCTION": getattr(config, "PRODUCTION", False),
