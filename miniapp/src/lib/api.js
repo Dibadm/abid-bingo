@@ -35,7 +35,7 @@ async function call(method, path, body) {
     headers['X-Dev-User-Id'] = devUserId;
   }
 
-  const res = await Promise.race([
+  const makeFetch = () => Promise.race([
     fetch(`${BASE_URL}/api${path}`, {
       method,
       headers,
@@ -43,6 +43,26 @@ async function call(method, path, body) {
     }),
     new Promise((_, rej) => setTimeout(() => rej(new Error('Network timeout — check your connection')), 15000)),
   ]);
+
+  let res = await makeFetch();
+
+  if (res.status === 429) {
+    const retryAfter = Math.min(
+      (async () => {
+        try {
+          const data = await res.json();
+          const detail = data.detail || data;
+          if (typeof detail === 'object' && detail.retry_after) {
+            return Number(detail.retry_after) * 1000;
+          }
+        } catch {}
+        return 5000;
+      })(),
+      30000,
+    );
+    await new Promise(r => setTimeout(r, retryAfter));
+    res = await makeFetch();
+  }
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {

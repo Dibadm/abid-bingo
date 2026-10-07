@@ -351,14 +351,25 @@ async def _scan_and_start_games(application):
         task_done = ACTIVE_GAME_TASKS[fee].done() if fee in ACTIVE_GAME_TASKS else "not_running"
         logger.debug("[scanner] room=%s game_id=%s state=%s task_status=%s", fee, game["id"], game["state"], task_done)
 
-        if game and game["state"] != "waiting" and game["id"] in active_triggers:
-            active_triggers.remove(game["id"])
+        if game and game["state"] not in ("waiting", "running"):
+            active_triggers.discard(game["id"])
 
         if game and game["state"] == "waiting" and game["id"] not in active_triggers:
             cards_sold = await _dbcall(db.count_cards_sold, game["id"])
             if cards_sold >= config.MIN_CARDS_TO_START:
                 logger.info(f"Scanner: {cards_sold} cards in Room {fee}, starting countdown...")
                 active_triggers.add(game["id"])
+                mock_context = type("obj", (object,), {"application": application})()
+                await ensure_game_lifecycle_started(mock_context, fee, game["id"])
+
+        # A running game only needs its lifecycle task restarted if it
+        # has no active task — that happens after a process restart,
+        # deploy, or crash, where ACTIVE_GAME_TASKS is lost but the DB
+        # row is still "running" with called_numbers persisted.
+        if game and game["state"] == "running":
+            has_task = fee in ACTIVE_GAME_TASKS and not ACTIVE_GAME_TASKS[fee].done()
+            if not has_task:
+                logger.info(f"Scanner: room {fee} game {game['id']} is running but has no task — resuming")
                 mock_context = type("obj", (object,), {"application": application})()
                 await ensure_game_lifecycle_started(mock_context, fee, game["id"])
 

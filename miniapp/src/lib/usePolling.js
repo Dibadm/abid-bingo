@@ -24,14 +24,11 @@ export function usePolling(fetchFn, options = {}) {
   const execute = useCallback(async () => {
     if (!mountedRef.current || inFlightRef.current) return;
     inFlightRef.current = true;
-    setLoading(true);
-    setError(null);
     try {
       const result = await fetchFn();
       if (mountedRef.current) {
         setData(result);
         setError(null);
-        currentIntervalRef.current = optsRef.current.interval;
       }
     } catch (err) {
       if (mountedRef.current) {
@@ -42,7 +39,6 @@ export function usePolling(fetchFn, options = {}) {
         );
       }
     } finally {
-      setLoading(false);
       inFlightRef.current = false;
       if (mountedRef.current) {
         if (timerRef.current) clearTimeout(timerRef.current);
